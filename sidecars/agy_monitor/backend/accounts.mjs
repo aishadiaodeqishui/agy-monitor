@@ -79,6 +79,25 @@ function uniqueStrings(arr) {
   return [...new Set((arr || []).filter(Boolean))];
 }
 
+function readRawFileSyncWithoutAsar(filePath, maxBytes) {
+  const hadNoAsar = Object.prototype.hasOwnProperty.call(process, 'noAsar');
+  const prevNoAsar = process.noAsar;
+  try {
+    // Electron's patched node:fs treats `.asar` archives as virtual directories
+    // (`statSync(asar).isFile() === false`), which breaks raw scanning inside
+    // Antigravity's sidecar runtime unless `process.noAsar` is temporarily enabled.
+    process.noAsar = true;
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return fs.readFileSync(filePath);
+  } catch {
+    return null;
+  } finally {
+    if (hadNoAsar) process.noAsar = prevNoAsar;
+    else delete process.noAsar;
+  }
+}
+
 /**
  * Discover Antigravity's desktop OAuth client dynamically from environment variables
  * or the locally installed Antigravity binaries (zero hardcoded client secrets in repo).
@@ -95,6 +114,7 @@ export async function discoverLocalOAuthClient({
     return {
       clientId: envId,
       clientSecret: envSecret,
+      candidateClientIds: [envId],
       candidateSecrets: [envSecret],
       source: 'env',
     };
@@ -137,17 +157,12 @@ export async function discoverLocalOAuthClient({
   for (const root of uniqueRoots) {
     for (const rel of ['app.asar', path.join('app', 'out', 'main.js')]) {
       const p = path.join(root, rel);
-      try {
-        const st = fs.statSync(p);
-        if (!st.isFile() || st.size > 160 * 1024 * 1024) continue;
-        const txt = fs.readFileSync(p).toString('latin1');
-        const hit = extractPersonalClientIdFromText(txt);
-        if (hit) {
-          personalId = hit;
-          break;
-        }
-      } catch {
-        // ignore missing/unreadable candidate
+      const buf = readRawFileSyncWithoutAsar(p, 160 * 1024 * 1024);
+      if (!buf) continue;
+      const hit = extractPersonalClientIdFromText(buf.toString('latin1'));
+      if (hit) {
+        personalId = hit;
+        break;
       }
     }
     if (personalId) break;
@@ -172,29 +187,27 @@ export async function discoverLocalOAuthClient({
   for (const root of uniqueRoots) {
     for (const rel of lsCandidates) {
       const p = path.join(root, rel);
-      try {
-        const st = fs.statSync(p);
-        if (!st.isFile() || st.size > 260 * 1024 * 1024) continue;
-        const txt = fs.readFileSync(p).toString('latin1');
-        const ids = uniqueStrings(txt.match(idRe) || []);
-        const secrets = uniqueStrings(txt.match(secRe) || []);
-        if (ids.length === 0 || secrets.length === 0) continue;
+      const buf = readRawFileSyncWithoutAsar(p, 260 * 1024 * 1024);
+      if (!buf) continue;
+      const txt = buf.toString('latin1');
+      const ids = uniqueStrings(txt.match(idRe) || []);
+      const secrets = uniqueStrings(txt.match(secRe) || []);
+      if (ids.length === 0 || secrets.length === 0) continue;
 
-        const chosenId = (personalId && ids.includes(personalId) ? personalId : '') || personalId || ids[0];
-        const idx = ids.indexOf(chosenId);
-        const primarySecret = (idx >= 0 && secrets[idx]) || secrets[0];
-        const candidateSecrets = uniqueStrings([primarySecret, ...secrets]);
+      const chosenId = (personalId && ids.includes(personalId) ? personalId : '') || personalId || ids[0];
+      const candidateClientIds = uniqueStrings([chosenId, ...ids]);
+      const idx = ids.indexOf(chosenId);
+      const primarySecret = (idx >= 0 && secrets[idx]) || secrets[0];
+      const candidateSecrets = uniqueStrings([primarySecret, ...secrets]);
 
-        cachedLocalOAuthClient = {
-          clientId: chosenId,
-          clientSecret: primarySecret,
-          candidateSecrets,
-          source: 'local_binary',
-        };
-        return cachedLocalOAuthClient;
-      } catch {
-        // ignore missing/unreadable candidate
-      }
+      cachedLocalOAuthClient = {
+        clientId: chosenId,
+        clientSecret: primarySecret,
+        candidateClientIds,
+        candidateSecrets,
+        source: 'local_binary',
+      };
+      return cachedLocalOAuthClient;
     }
   }
 
@@ -919,43 +932,53 @@ export async function refreshAccessTokenForCredential(
     err.status = 500;
     throw err;
   }
+  const clientIdsToTry = uniqueStrings([client.clientId, ...(client.candidateClientIds || [])]);
   const secretsToTry = uniqueStrings([client.clientSecret, ...(client.candidateSecrets || [])]);
 
   let payload = null;
   let lastErr = null;
-  for (const secret of secretsToTry) {
-    const res = await fetchImpl('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: client.clientId,
-        client_secret: secret,
-        refresh_token: refreshToken,
-        grant_type: 'refresh_token',
-      }).toString(),
-    });
+  for (const cid of clientIdsToTry) {
+    for (const secret of secretsToTry) {
+      const res = await fetchImpl('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: cid,
+          client_secret: secret,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token',
+        }).toString(),
+      });
 
-    if (res.ok) {
-      if (cachedLocalOAuthClient && cachedLocalOAuthClient.clientId === client.clientId) {
-        cachedLocalOAuthClient = { ...cachedLocalOAuthClient, clientSecret: secret };
+      if (res.ok) {
+        if (cachedLocalOAuthClient && cachedLocalOAuthClient.source === 'local_binary') {
+          cachedLocalOAuthClient = {
+            ...cachedLocalOAuthClient,
+            clientId: cid,
+            clientSecret: secret,
+            candidateClientIds: uniqueStrings([cid, ...(cachedLocalOAuthClient.candidateClientIds || [])]),
+            candidateSecrets: uniqueStrings([secret, ...(cachedLocalOAuthClient.candidateSecrets || [])]),
+          };
+        }
+        payload = await res.json();
+        break;
       }
-      payload = await res.json();
-      break;
-    }
 
-    const errText = await res.text().catch(() => '');
-    if (res.status === 401 && /invalid_client|unauthorized_client/i.test(errText)) {
-      lastErr = new Error(`Google OAuth 客户端校验失败 (HTTP 401): ${errText.slice(0, 120)}`);
-      lastErr.status = 401;
-      continue;
+      const errText = await res.text().catch(() => '');
+      if (res.status === 401 && /invalid_client|unauthorized_client/i.test(errText)) {
+        lastErr = new Error(`Google OAuth 客户端校验失败 (HTTP 401): ${errText.slice(0, 120)}`);
+        lastErr.status = 401;
+        continue;
+      }
+      const err = new Error(
+        res.status === 400 || res.status === 401
+          ? '该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权'
+          : `刷新 Google OAuth 令牌失败 (HTTP ${res.status}): ${errText.slice(0, 160)}`,
+      );
+      err.status = res.status === 400 || res.status === 401 ? 401 : res.status || 502;
+      throw err;
     }
-    const err = new Error(
-      res.status === 400 || res.status === 401
-        ? '该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权'
-        : `刷新 Google OAuth 令牌失败 (HTTP ${res.status}): ${errText.slice(0, 160)}`,
-    );
-    err.status = res.status === 400 || res.status === 401 ? 401 : res.status || 502;
-    throw err;
+    if (payload) break;
   }
 
   if (!payload) {
