@@ -165,6 +165,7 @@ export function resolvePaths(overrides = {}) {
     nativeWallpaperCssFile: path.join(pluginDataDir, 'native_wallpaper.css'),
     nativeWallpaperEngineFile: path.join(pluginDataDir, 'native_wallpaper_engine.js'),
     consoleViewportFile: path.join(pluginDataDir, 'console_viewport.json'),
+    sidecarOwnerFile: path.join(pluginDataDir, 'sidecar_owner.json'),
     ...(typeof overrides.hostAsarPath === 'string'
       ? { hostAsarPath: overrides.hostAsarPath }
       : overrides.appDataDir

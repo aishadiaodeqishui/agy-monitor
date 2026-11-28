@@ -615,7 +615,10 @@ function buildRemoveHudExpr() {
  * 2) Renders a 120fps native inline composer HUD when CDP is connected (zero drag lag!);
  * 3) Provides reversible in-memory Chinese UI localization for Antigravity host without editing app.asar.
  */
-export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
+export function createCdpThemeBridge(
+  paths,
+  { onHudStateChange = null, isOwnerActive = null, resolveLatestState = null } = {},
+) {
   /** @type {Map<string, { ws: WebSocket, wsUrl: string, title: string, url: string, type: string, cssApplied: boolean, hudInjected: boolean, hudMountedSig: string, hudGuideSig: string, hostLocalized: boolean }>} */
   const sessions = new Map();
   const connectingUrls = new Set();
@@ -1220,7 +1223,12 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   };
 
   const syncHudAll = async () => {
-    if (disposed || !hasOpenSessions()) {
+    if (!canControlHost()) {
+      relinquishHostControl();
+      notifyHudStateIfChanged();
+      return false;
+    }
+    if (!hasOpenSessions()) {
       notifyHudStateIfChanged();
       return false;
     }
@@ -1467,10 +1475,50 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     return needsResync;
   };
 
+  const canControlHost = () =>
+    !disposed && (typeof isOwnerActive !== 'function' || Boolean(isOwnerActive()));
+
+  const relinquishHostControl = () => {
+    ensureLoops(false);
+    closeAllSessions();
+  };
+
+  let refreshStatePromise = null;
+  const refreshLatestStateFromDisk = async () => {
+    if (typeof resolveLatestState !== 'function' || !canControlHost()) return;
+    if (!refreshStatePromise) {
+      refreshStatePromise = Promise.resolve()
+        .then(() => resolveLatestState())
+        .then((fresh) => {
+          if (!fresh || typeof fresh !== 'object' || !canControlHost()) return;
+          if (fresh.themes && typeof fresh.themes === 'object') {
+            latestThemes = fresh.themes;
+          }
+          if (fresh.hostLanguage === 'zh-CN' || fresh.hostLanguage === 'en') {
+            latestHostLanguage = fresh.hostLanguage;
+          }
+          if (typeof fresh.liteMode === 'boolean') {
+            latestLiteMode = fresh.liteMode;
+          } else if (typeof fresh.themes?.liteMode === 'boolean') {
+            latestLiteMode = fresh.themes.liteMode;
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          refreshStatePromise = null;
+        });
+    }
+    await refreshStatePromise;
+  };
+
   const ensureLoops = (wantCdp) => {
-    if (wantCdp && !retryTimer && !disposed) {
+    if (wantCdp && !retryTimer && canControlHost()) {
       retryTimer = setInterval(() => {
-        if (disposed || !latestThemes) return;
+        if (!canControlHost()) {
+          relinquishHostControl();
+          return;
+        }
+        if (!latestThemes) return;
         const wantHud = wantDomHudFor(latestThemes);
         const isCdpMode = latestThemes.hostThemeMode === 'cdp';
         const needCss = wantCdpCssFor(latestThemes);
@@ -1490,48 +1538,66 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
         if (!hasOpenSessions()) {
           // Avoid noisy reconnect loops every 2s when native main-process already handles HUD & wallpaper
           if (isCdpMode || needCss || needCdpHud || retryTickCount % 6 === 0) {
-            void sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
+            void (async () => {
+              await refreshLatestStateFromDisk();
+              if (!canControlHost() || !latestThemes) return;
+              await sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
+            })();
           }
           return;
         }
         if ((needCss && !isAnyStyleApplied()) || (needI18n && !isAnyHostLocalized()) || (needCdpHud && !isHudInjected())) {
-          void sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
+          void (async () => {
+            await refreshLatestStateFromDisk();
+            if (!canControlHost() || !latestThemes) return;
+            await sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
+          })();
           return;
         }
         // Periodically detect newly opened windows & Ctrl+R page reloads whose DOM lost injected nodes
         if (retryTickCount % 3 === 0) {
           void (async () => {
-            const lostMarkers = await probeSessionMarkers(needCss, needI18n, needCdpHud);
-            if (disposed || !latestThemes) return;
+            await refreshLatestStateFromDisk();
+            if (!canControlHost() || !latestThemes) return;
+            const freshWantHud = wantDomHudFor(latestThemes);
+            const freshNeedCss = wantCdpCssFor(latestThemes);
+            const freshNeedI18n = latestHostLanguage === 'zh-CN';
+            const freshNeedCdpHud = freshWantHud && !isNativeMainProcessAlive();
+            const lostMarkers = await probeSessionMarkers(freshNeedCss, freshNeedI18n, freshNeedCdpHud);
+            if (!canControlHost() || !latestThemes) return;
             if (lostMarkers) {
               await sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
               return;
             }
             const prevCount = sessions.size;
             const ok = await ensureConnected(activePort);
-            if (!disposed && ok && sessions.size > prevCount) {
+            if (canControlHost() && ok && sessions.size > prevCount) {
               await sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
             }
           })();
         }
       }, 2200);
       if (typeof retryTimer.unref === 'function') retryTimer.unref();
-    } else if (!wantCdp && retryTimer) {
+    } else if ((!wantCdp || !canControlHost()) && retryTimer) {
       clearInterval(retryTimer);
       retryTimer = null;
       retryTickCount = 0;
     }
 
-    if (wantCdp && !hudTickTimer && !disposed) {
+    if (wantCdp && !hudTickTimer && canControlHost()) {
       hudTickTimer = setInterval(() => {
-        if (disposed || !hasOpenSessions()) return;
+        if (!canControlHost()) {
+          relinquishHostControl();
+          return;
+        }
+        if (!hasOpenSessions()) return;
         const wantHud = wantDomHudFor(latestThemes);
         if (wantHud && (latestThemes?.hostThemeMode === 'cdp' || !isNativeMainProcessAlive())) {
           void syncHudAll();
         }
       }, 900);
       if (typeof hudTickTimer.unref === 'function') hudTickTimer.unref();
-    } else if (!wantCdp && hudTickTimer) {
+    } else if ((!wantCdp || !canControlHost()) && hudTickTimer) {
       clearInterval(hudTickTimer);
       hudTickTimer = null;
     }
@@ -1539,7 +1605,11 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
 
   const updateHudData = async (hudPayload) => {
     latestHudData = hudPayload || null;
-    if (disposed || !hasOpenSessions() || !wantDomHudFor(latestThemes)) return false;
+    if (!canControlHost()) {
+      relinquishHostControl();
+      return false;
+    }
+    if (!hasOpenSessions() || !wantDomHudFor(latestThemes)) return false;
     if (latestThemes?.hostThemeMode !== 'cdp' && isNativeMainProcessAlive()) {
       return true;
     }
@@ -1547,7 +1617,10 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   };
 
   const sync = async (themes = {}, options = {}) => {
-    if (disposed) return getStatus(themes);
+    if (!canControlHost()) {
+      relinquishHostControl();
+      return getStatus(themes);
+    }
     latestThemes = themes;
     if (options.hostLanguage === 'zh-CN' || options.hostLanguage === 'en') {
       latestHostLanguage = options.hostLanguage;
@@ -1678,15 +1751,17 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     };
   };
 
-  const dispose = async () => {
+  const dispose = async ({ preserveHostDom = false } = {}) => {
     disposed = true;
     ensureLoops(false);
-    await restoreHostI18nAll().catch(() => {});
-    if (!(latestThemes?.hostThemeMode === 'inject' && isNativeWallpaperAlive())) {
-      await removeCssAll().catch(() => {});
-    }
-    if (!isNativeMainProcessAlive()) {
-      await removeHudAll().catch(() => {});
+    if (!preserveHostDom) {
+      await restoreHostI18nAll().catch(() => {});
+      if (!(latestThemes?.hostThemeMode === 'inject' && isNativeWallpaperAlive())) {
+        await removeCssAll().catch(() => {});
+      }
+      if (!isNativeMainProcessAlive()) {
+        await removeHudAll().catch(() => {});
+      }
     }
     closeAllSessions();
     closeWslProxy();

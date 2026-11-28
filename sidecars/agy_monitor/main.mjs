@@ -90,6 +90,10 @@ import {
 } from './backend/quota.mjs';
 import { createAccountManager, ensureAccountTool } from './backend/accounts.mjs';
 import {
+  createHostLivenessWatcher,
+  createSidecarOwnershipLease,
+} from './backend/sidecar_lifecycle.mjs';
+import {
   applyPluginUpdate,
   checkForUpdates,
   listOfficialReleases,
@@ -625,7 +629,14 @@ async function readPinnedBubbleSessionIds(paths) {
   }
 }
 
-export function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient = null) {
+export function createHudTelemetryPublisher(
+  paths,
+  store,
+  cdpBridge = null,
+  quotaClient = null,
+  { isOwnerActive = null } = {},
+) {
+  const canPublish = () => typeof isOwnerActive !== 'function' || Boolean(isOwnerActive());
   let lastSig = '';
   let inFlight = false;
   let queued = false;
@@ -715,13 +726,14 @@ export function createHudTelemetryPublisher(paths, store, cdpBridge = null, quot
       unreadSessionCount = null,
     } = {},
   ) => {
-    if (!paths?.hudTelemetryFile || (!telemetry && !forceEmpty)) return Promise.resolve();
+    if (!paths?.hudTelemetryFile || (!telemetry && !forceEmpty) || !canPublish()) return Promise.resolve();
     if (Array.isArray(sessionProgress)) {
       lastSessionProgress = sessionProgress;
     }
     lastWrittenTelemetry = telemetry;
     lastWrittenOpts = { sessionsHudList, sessionProgress: lastSessionProgress, forceEmpty, activeSessionCount, unreadSessionCount };
     writeChain = writeChain.then(async () => {
+      if (!canPublish()) return;
       const pie = forceEmpty ? {} : (telemetry?.contextPie || {});
       const rt = forceEmpty ? {} : (telemetry?.runtimeTelemetry || {});
       const prefsForHud = await store?.getPrefs?.().catch(() => null);
@@ -886,7 +898,7 @@ export function createHudTelemetryPublisher(paths, store, cdpBridge = null, quot
   };
 
   const refreshFromDb = async () => {
-    if (!paths?.hudTelemetryFile) return;
+    if (!paths?.hudTelemetryFile || !canPublish()) return;
     if (inFlight) {
       queued = true;
       return;
@@ -3161,11 +3173,37 @@ export async function startSidecarServer({
   pathsOverrides = {},
   scanIntervalMs = 2000,
   skipWorker = false,
+  exitOnAutoShutdown = false,
 } = {}) {
   const { SidecarApp, Response } = await loadSidecarSdk();
   const app = new SidecarApp();
   const paths = resolvePaths(pathsOverrides);
   const storage = createStorage(paths);
+  let shutdown = async () => {};
+  const triggerSelfRetire = (reason) => {
+    console.warn(`[sidecar] relinquishing control (${reason}); shutting down without disturbing host DOM`);
+    void shutdown({ preserveHostDom: true }).finally(() => {
+      if (exitOnAutoShutdown) {
+        process.exit(0);
+      }
+    });
+  };
+  const ownershipLease = createSidecarOwnershipLease(paths, {
+    lsAddress: process.env.ANTIGRAVITY_LS_ADDRESS || '',
+    onSuperseded(nextOwner) {
+      triggerSelfRetire(`superseded by pid=${nextOwner?.pid || 'unknown'}`);
+    },
+  });
+  const isOwnerActive = () => ownershipLease.isOwner();
+  const resolveLatestCdpState = async () => {
+    const [themes, prefs] = await Promise.all([storage.getThemes(), storage.getPrefs()]);
+    const liteMode = Boolean(prefs?.liteMode);
+    return {
+      themes: { ...themes, liteMode },
+      hostLanguage: prefs?.language === 'en' ? 'en' : 'zh-CN',
+      liteMode,
+    };
+  };
   const isQuotaEnabledFn = async () => {
     try {
       const prefs = await storage.getPrefs();
@@ -3180,8 +3218,12 @@ export async function startSidecarServer({
     onHudStateChange() {
       void hudPublisher?.refreshFromDb?.();
     },
+    isOwnerActive,
+    resolveLatestState: resolveLatestCdpState,
   });
-  hudPublisher = createHudTelemetryPublisher(paths, storage, cdpBridge, sharedQuotaClient);
+  hudPublisher = createHudTelemetryPublisher(paths, storage, cdpBridge, sharedQuotaClient, {
+    isOwnerActive,
+  });
 
   let latestWorkerEtag = '';
   const worker = skipWorker
@@ -3260,6 +3302,20 @@ export async function startSidecarServer({
   const server = await app.run();
   attachCorsAndPreflight(server);
 
+  const boundPort = Number(server?.address?.()?.port) || 0;
+  await ownershipLease.claim({ port: boundPort }).catch(() => {});
+  ownershipLease.startWatching();
+
+  const hostLivenessWatcher = !skipWorker
+    ? createHostLivenessWatcher({
+        lsAddress: process.env.ANTIGRAVITY_LS_ADDRESS || '',
+        onHostLost(info) {
+          triggerSelfRetire(`originating language_server ${info.host}:${info.port} unreachable`);
+        },
+      })
+    : null;
+  hostLivenessWatcher?.start();
+
   // Materialize default preferences/themes/mastery config on first run (never overwrites user changes)
   void Promise.all([
     storage.getPrefs(),
@@ -3282,9 +3338,11 @@ export async function startSidecarServer({
   if (!skipWorker && paths.pluginDataDir) {
     try {
       activeViewWatcher = fsSync.watch(paths.pluginDataDir, (_evt, filename) => {
+        if (!isOwnerActive()) return;
         if (!filename || String(filename).toLowerCase() === 'hud_active_view.json') {
           clearTimeout(activeViewTimer);
           activeViewTimer = setTimeout(() => {
+            if (!isOwnerActive()) return;
             void hudPublisher.refreshFromDb();
           }, 25);
         }
@@ -3303,10 +3361,11 @@ export async function startSidecarServer({
   let lastAsarLockRetryMs = 0;
 
   const ensureNativeHudHealthy = async () => {
-    if (nativeHudWatchdogBusy) return;
+    if (nativeHudWatchdogBusy || !isOwnerActive()) return;
     nativeHudWatchdogBusy = true;
     try {
       const [themes, prefs] = await Promise.all([storage.getThemes(), storage.getPrefs()]);
+      if (!isOwnerActive()) return;
       const liteMode = Boolean(prefs.liteMode);
       const themesWithLite = { ...themes, liteMode };
       const hudEnabled = themes.hudEnabled !== false;
@@ -3359,10 +3418,11 @@ export async function startSidecarServer({
   };
 
   const ensureCompanionHealthy = async () => {
-    if (companionWatchdogBusy) return;
+    if (companionWatchdogBusy || !isOwnerActive()) return;
     companionWatchdogBusy = true;
     try {
       const themes = await storage.getThemes();
+      if (!isOwnerActive()) return;
       const nativeDomAlive = readNativeHudHeartbeat(paths).alive || cdpBridge.isHudInjected();
       const wantBackdrop = Boolean(
         themes.backdropEnabled && themes.activeWallpaperId && themes.hostThemeMode === 'backdrop',
@@ -3429,40 +3489,48 @@ export async function startSidecarServer({
     companionWatchdogTimer.unref?.();
   }
 
-  const shutdown = async () => {
-    clearTimeout(activeViewTimer);
-    sharedAccountManager.stopLifecycleWatcher();
-    sharedMemoryManager.stopAutoGuard();
-    if (companionWatchdogTimer) {
-      clearInterval(companionWatchdogTimer);
-      companionWatchdogTimer = null;
-    }
-    try {
-      activeViewWatcher?.close?.();
-    } catch {
-      // Ignore watcher close error
-    }
-    await cdpBridge.dispose().catch(() => {});
-    if (process.env.AGY_DISABLE_EXTENSIONS !== '1' && process.env.AGY_DISABLE_EXTENSIONS !== 'true') {
-      for (const ext of installedExtensions) {
-        if (typeof ext?.onShutdown === 'function') {
-          await Promise.resolve(ext.onShutdown({ paths, storage, skipWorker })).catch(() => {});
-        }
+  let shutdownPromise = null;
+  shutdown = async ({ preserveHostDom = false } = {}) => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      const keepHost = Boolean(preserveHostDom || ownershipLease.isSuperseded());
+      hostLivenessWatcher?.stop();
+      await ownershipLease.release().catch(() => {});
+      clearTimeout(activeViewTimer);
+      sharedAccountManager.stopLifecycleWatcher();
+      sharedMemoryManager.stopAutoGuard();
+      if (companionWatchdogTimer) {
+        clearInterval(companionWatchdogTimer);
+        companionWatchdogTimer = null;
       }
-    }
-    if (!skipWorker && startupHostEnv.hasWindowsHost) {
       try {
-        const themes = await storage.getThemes();
-        const status = await getBackdropStatus(paths, themes);
-        if (status.canAutoLaunch && status.running) {
-          await controlBackdropCompanion(paths, themes, 'stop');
-        }
+        activeViewWatcher?.close?.();
       } catch {
-        // Ignore companion shutdown error
+        // Ignore watcher close error
       }
-    }
-    await worker.stop();
-    await app.close();
+      await cdpBridge.dispose({ preserveHostDom: keepHost }).catch(() => {});
+      if (!keepHost && process.env.AGY_DISABLE_EXTENSIONS !== '1' && process.env.AGY_DISABLE_EXTENSIONS !== 'true') {
+        for (const ext of installedExtensions) {
+          if (typeof ext?.onShutdown === 'function') {
+            await Promise.resolve(ext.onShutdown({ paths, storage, skipWorker })).catch(() => {});
+          }
+        }
+      }
+      if (!keepHost && !skipWorker && startupHostEnv.hasWindowsHost) {
+        try {
+          const themes = await storage.getThemes();
+          const status = await getBackdropStatus(paths, themes);
+          if (status.canAutoLaunch && status.running) {
+            await controlBackdropCompanion(paths, themes, 'stop');
+          }
+        } catch {
+          // Ignore companion shutdown error
+        }
+      }
+      await worker.stop();
+      await app.close();
+    })();
+    return shutdownPromise;
   };
 
   process.once('SIGINT', () => {
@@ -3477,6 +3545,7 @@ export async function startSidecarServer({
     server,
     paths,
     storage,
+    ownershipLease,
     getLatestWorkerEtag: () => latestWorkerEtag,
     shutdown,
   };
@@ -3487,5 +3556,5 @@ const isEntrypoint =
   import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 
 if (isEntrypoint) {
-  await startSidecarServer();
+  await startSidecarServer({ exitOnAutoShutdown: true });
 }
